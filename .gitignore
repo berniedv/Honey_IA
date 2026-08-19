@@ -1,0 +1,10 @@
+.env
+memoria.json
+archivos_indice.json
+archivos/
+venv/
+__pycache__/
+credentials.json
+credentials.json.json
+*.pyc
+honey_web.py.v1bak
