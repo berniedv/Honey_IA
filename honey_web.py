@@ -1770,6 +1770,8 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
 .btn-attach { background: #1A1A18; border: 1px solid var(--borde); border-radius: 12px; min-width: 44px; height: 44px; cursor: pointer; font-size: 20px; color: #8A8578; flex-shrink: 0; }
 .btn-mic { background: #1A1A18; border: 1px solid var(--borde); border-radius: 12px; min-width: 44px; height: 44px; cursor: pointer; font-size: 19px; color: #8A8578; flex-shrink: 0; transition: all .15s; }
 .btn-mic.grabando { background: #F0A028; color: #0A0A0A; border-color: #F0A028; animation: latido 1.1s infinite; }
+.btn-dialogo.activo { background: #1E3A1E; color: #78C878; border-color: #2A4A2A; }
+.btn-dialogo.activo.grabando { background: #F0A028; color: #0A0A0A; border-color: #F0A028; animation: latido 1.1s infinite; }
 @keyframes latido { 0%,100% { box-shadow: 0 0 0 0 rgba(240,160,40,.55); } 50% { box-shadow: 0 0 0 9px rgba(240,160,40,0); } }
 .icon-btn.voz-on { color: var(--amarillo); border-color: var(--amarillo); }
 .btn-send { background: var(--amarillo); color: #0A0A0A; border: none; border-radius: 12px; padding: 0 18px; height: 44px; font-size: 14px; font-weight: 700; cursor: pointer; flex-shrink: 0; }
@@ -1855,7 +1857,8 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
     <div id="input-area">
       <input type="file" id="file-input" accept=".pdf,.docx,.doc,.xlsx,.xls,.txt">
       <button class="btn-attach" onclick="document.getElementById('file-input').click()" title="Adjuntar">+</button>
-      <button class="btn-mic" id="mic" onclick="toggleMic()" title="Hablar">&#127908;</button>
+      <button class="btn-mic" id="mic" onclick="toggleMic()" title="Apreta para hablar, apreta para enviar">&#127908;</button>
+      <button class="btn-mic btn-dialogo" id="btn-dialogo" onclick="toggleDialogo()" title="Conversar en voz alta (manos libres)">&#128172;</button>
       <textarea id="texto" placeholder="Escribi o toca el microfono..." rows="1"></textarea>
       <button class="btn-send" id="btn" onclick="enviar()">Enviar</button>
     </div>
@@ -1892,7 +1895,11 @@ let recog = null, escuchando = false;
 let vozActiva = false;
 try { vozActiva = localStorage.getItem('honey_voz') === '1'; } catch(e) {}
 
-if (!SR) { btnMic.style.display = 'none'; }
+if (!SR) {
+  btnMic.style.display = 'none';
+  const bd = document.getElementById('btn-dialogo');
+  if (bd) bd.style.display = 'none';
+}
 pintarBotonVoz();
 
 function pintarBotonVoz() {
@@ -1946,8 +1953,8 @@ function probarVoz() {
   vozActiva = previo;
 }
 
-function hablar(texto) {
-  if (!vozActiva || !window.speechSynthesis || !texto) return;
+function hablar(texto, alTerminar) {
+  if (!vozActiva || !window.speechSynthesis || !texto) { if (alTerminar) alTerminar(); return; }
   try {
     window.speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(texto);
@@ -1957,39 +1964,132 @@ function hablar(texto) {
     const voces = vocesDisponibles();
     const v = voces.find(x => x.name === vozElegida) || voces[0];
     if (v) { u.voice = v; if (v.lang) u.lang = v.lang; }
+    let listo = false;
+    const terminar = () => { if (listo) return; listo = true; if (alTerminar) alTerminar(); };
+    u.onend = terminar;
+    u.onerror = terminar;
     window.speechSynthesis.speak(u);
-  } catch(e) {}
+  } catch(e) { if (alTerminar) alTerminar(); }
 }
 
 llenarSelectorVoces();
 try { window.speechSynthesis.onvoiceschanged = llenarSelectorVoces; } catch(e) {}
 
-function toggleMic() {
-  if (!SR) return;
-  if (escuchando) { try { recog.stop(); } catch(e) {} return; }
+/* ---------- MICROFONO ----------
+   Dos modos:
+   - Apretar para hablar: arranca y NO se corta sola. Volves a apretar y recien ahi manda.
+   - Modo conversacion: manda sola cuando dejas de hablar, HONEY contesta en voz alta
+     y el microfono se vuelve a abrir. Se corta cuando vos lo cortas.            */
+
+const btnDialogo = document.getElementById('btn-dialogo');
+const SILENCIO_MS = 1900;   // cuanto espera en modo conversacion antes de mandar
+let modoConversacion = false;
+let paradaManual = false;
+let relojSilencio = null;
+let textoBase = '';
+// Marca que el microfono quedo abierto a proposito (modo apretar para hablar).
+let sigoEsperando = false;
+
+function pintarMic() {
+  btnMic.classList.toggle('grabando', escuchando && !modoConversacion);
+  if (btnDialogo) {
+    btnDialogo.classList.toggle('activo', modoConversacion);
+    btnDialogo.classList.toggle('grabando', modoConversacion && escuchando);
+    btnDialogo.title = modoConversacion ? 'Cortar la conversacion' : 'Conversar en voz alta (manos libres)';
+  }
+}
+
+function frenarReloj() { if (relojSilencio) { clearTimeout(relojSilencio); relojSilencio = null; } }
+
+function arrancarEscucha() {
+  if (!SR || escuchando) return;
   try { window.speechSynthesis.cancel(); } catch(e) {}
+  paradaManual = false;
+  textoBase = tx.value.trim();
   recog = new SR();
   recog.lang = 'es-AR';
   recog.interimResults = true;
-  recog.continuous = false;
-  const base = tx.value.trim();
-  let final = '';
-  recog.onstart = () => { escuchando = true; btnMic.classList.add('grabando'); };
+  recog.continuous = true;   // clave: ya no se corta sola en la primera pausa
+
+  recog.onstart = () => { escuchando = true; pintarMic(); };
+
   recog.onresult = (ev) => {
     let txt = '';
     for (let i = 0; i < ev.results.length; i++) txt += ev.results[i][0].transcript;
-    final = txt;
-    tx.value = (base ? base + ' ' : '') + txt;
+    tx.value = (textoBase ? textoBase + ' ' : '') + txt;
     tx.style.height = 'auto';
     tx.style.height = Math.min(tx.scrollHeight, 120) + 'px';
+    // En modo conversacion, el silencio es la senal de "termine de hablar".
+    if (modoConversacion) {
+      frenarReloj();
+      relojSilencio = setTimeout(() => { if (tx.value.trim()) detenerEscucha(true); }, SILENCIO_MS);
+    }
   };
-  recog.onerror = () => { escuchando = false; btnMic.classList.remove('grabando'); };
+
+  recog.onerror = (ev) => {
+    // 'no-speech' y 'aborted' son normales, no hay que avisar nada.
+    if (ev && ev.error === 'not-allowed') {
+      modoConversacion = false;
+      agregar('El navegador no me dio permiso para usar el microfono.', 'sistema');
+    }
+  };
+
   recog.onend = () => {
     escuchando = false;
-    btnMic.classList.remove('grabando');
-    if (final.trim()) enviar();
+    pintarMic();
+    if (paradaManual) return;
+    // Chrome corta la sesion sola cada tanto: si nadie la freno, la reabrimos.
+    if (modoConversacion || sigoEsperando) { setTimeout(() => { if (modoConversacion || sigoEsperando) arrancarEscucha(); }, 250); }
   };
-  try { recog.start(); } catch(e) { escuchando = false; btnMic.classList.remove('grabando'); }
+
+  try { recog.start(); } catch(e) { escuchando = false; pintarMic(); }
+}
+
+function detenerEscucha(mandar) {
+  frenarReloj();
+  paradaManual = true;
+  sigoEsperando = false;
+  try { if (recog) recog.stop(); } catch(e) {}
+  escuchando = false;
+  pintarMic();
+  if (mandar && tx.value.trim()) enviar();
+}
+
+function toggleMic() {
+  if (!SR) return;
+  if (modoConversacion) { cortarConversacion(); return; }
+  if (escuchando || sigoEsperando) { detenerEscucha(true); return; }
+  sigoEsperando = true;
+  arrancarEscucha();
+}
+
+function toggleDialogo() {
+  if (!SR) return;
+  if (modoConversacion) { cortarConversacion(); return; }
+  modoConversacion = true;
+  sigoEsperando = false;
+  if (!vozActiva) { vozActiva = true; try { localStorage.setItem('honey_voz','1'); } catch(e) {} pintarBotonVoz(); }
+  agregar('Modo conversacion activado. Hablame y te contesto. Tocá de nuevo el botón para cortar.', 'sistema');
+  pintarMic();
+  arrancarEscucha();
+}
+
+function cortarConversacion() {
+  modoConversacion = false;
+  frenarReloj();
+  paradaManual = true;
+  sigoEsperando = false;
+  try { if (recog) recog.stop(); } catch(e) {}
+  try { window.speechSynthesis.cancel(); } catch(e) {}
+  escuchando = false;
+  pintarMic();
+  agregar('Conversacion cortada.', 'sistema');
+}
+
+// Cuando HONEY termina de hablar, en modo conversacion el microfono vuelve a abrirse solo.
+function seguirConversacion() {
+  if (!modoConversacion) return;
+  setTimeout(() => { if (modoConversacion && !escuchando) arrancarEscucha(); }, 350);
 }
 
 tx.addEventListener('input', () => { tx.style.height='auto'; tx.style.height=Math.min(tx.scrollHeight,120)+'px'; });
@@ -2117,8 +2217,9 @@ async function enviar() {
     const r = await req('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({texto:msg})});
     const d = await r.json();
     p.textContent = d.respuesta; p.classList.remove('pensando');
-    hablar(d.respuesta);
-  } catch(e) { p.textContent = 'Error al conectar.'; }
+    // En modo conversacion, cuando termina de hablar vuelve a abrir el microfono.
+    hablar(d.respuesta, seguirConversacion);
+  } catch(e) { p.textContent = 'Error al conectar.'; seguirConversacion(); }
   btn.disabled=false;
 }
 
