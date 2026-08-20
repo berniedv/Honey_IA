@@ -10,8 +10,9 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import (FastAPI, UploadFile, File, Depends, HTTPException, status,
+                     Request, Form, BackgroundTasks)
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel
 import anthropic, json, io
 
@@ -27,6 +28,9 @@ CREDENCIALES_SHEETS = os.path.join(BASE_DIR, "credentials.json")
 PERFIL_FILE = os.path.join(BASE_DIR, "perfil.md")
 GOOGLE_TOKENS_FILE = os.path.join(BASE_DIR, "google_tokens.json")
 PENDIENTES_FILE = os.path.join(BASE_DIR, "pendientes.json")
+CONTACTOS_FILE = os.path.join(BASE_DIR, "contactos.json")
+MENSAJES_FILE = os.path.join(BASE_DIR, "mensajes.json")
+CARPETA_CHATS = os.path.join(BASE_DIR, "chats")
 
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 HONEY_USER = os.environ.get("HONEY_USER", "bernardo")
@@ -47,6 +51,12 @@ GOOGLE_SCOPES = " ".join([
     "https://www.googleapis.com/auth/calendar.events",
 ])
 MAX_LIMPIEZA = 50  # tope de mails por operacion
+
+# ---- WhatsApp (Meta Cloud API) ----
+WA_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
+WA_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
+WA_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "honey-verifica")
+WA_API = "https://graph.facebook.com/v21.0"
 
 # Cuantos mensajes recientes se le mandan a Claude (el Perfil va siempre aparte)
 MAX_MENSAJES = 40
@@ -323,6 +333,93 @@ def gmail_crear_borrador(email, para, asunto, cuerpo, responder_a_id=None):
         "nota": "Borrador creado en Gmail. Bernardo lo revisa y lo envia desde Gmail.",
     }
 
+# =====================================================================
+# GOOGLE CALENDAR
+# =====================================================================
+
+ZONA = "America/Argentina/Buenos_Aires"
+
+def calendar_api(email, metodo, ruta, **kw):
+    tok = access_token(email)
+    url = "https://www.googleapis.com/calendar/v3" + ruta
+    r = httpx.request(metodo, url, headers={"Authorization": "Bearer " + tok}, timeout=45, **kw)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Calendar respondio {r.status_code}: {r.text[:300]}")
+    return r.json() if r.text.strip() else {}
+
+def _iso(dt_txt, fin_de_dia=False):
+    """Acepta 'YYYY-MM-DD' o 'YYYY-MM-DDTHH:MM'. Devuelve ISO con zona de Argentina."""
+    from datetime import timedelta
+    t = (dt_txt or "").strip()
+    if not t:
+        base = datetime.now(ZoneInfo(ZONA))
+    elif "T" in t:
+        base = datetime.fromisoformat(t)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=ZoneInfo(ZONA))
+    else:
+        d = datetime.fromisoformat(t)
+        base = d.replace(hour=23, minute=59, second=59, tzinfo=ZoneInfo(ZONA)) if fin_de_dia \
+            else d.replace(hour=0, minute=0, second=0, tzinfo=ZoneInfo(ZONA))
+    return base.isoformat()
+
+def cal_listar(email, desde="", dias=7):
+    from datetime import timedelta
+    dias = max(1, min(int(dias or 7), 60))
+    ini_txt = _iso(desde) if desde else datetime.now(ZoneInfo(ZONA)).isoformat()
+    ini_dt = datetime.fromisoformat(ini_txt)
+    fin_dt = ini_dt + timedelta(days=dias)
+    data = calendar_api(email, "GET", "/calendars/primary/events", params={
+        "timeMin": ini_dt.isoformat(),
+        "timeMax": fin_dt.isoformat(),
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "maxResults": 50,
+    })
+    eventos = []
+    for e in data.get("items", []):
+        ini = e.get("start", {})
+        fin = e.get("end", {})
+        eventos.append({
+            "id": e.get("id"),
+            "titulo": e.get("summary", "(sin titulo)"),
+            "desde": ini.get("dateTime") or ini.get("date"),
+            "hasta": fin.get("dateTime") or fin.get("date"),
+            "todo_el_dia": bool(ini.get("date")),
+            "donde": e.get("location", ""),
+            "descripcion": (e.get("description", "") or "")[:400],
+            "creado_por": (e.get("creator", {}) or {}).get("email", ""),
+        })
+    return eventos
+
+def cal_crear(email, titulo, inicio, fin="", descripcion="", donde="", creado_por=""):
+    from datetime import timedelta
+    if not titulo:
+        return {"error": "Falta el titulo del evento."}
+    if not inicio:
+        return {"error": "Falta la fecha y hora de inicio."}
+    ini = _iso(inicio)
+    if fin:
+        fin_iso = _iso(fin)
+    else:
+        fin_iso = (datetime.fromisoformat(ini) + timedelta(hours=1)).isoformat()
+
+    desc = descripcion or ""
+    if creado_por:
+        desc = (desc + "\n\n" if desc else "") + f"[Agendado por {creado_por} a traves de HONEY]"
+
+    cuerpo = {
+        "summary": titulo,
+        "description": desc,
+        "start": {"dateTime": ini, "timeZone": ZONA},
+        "end": {"dateTime": fin_iso, "timeZone": ZONA},
+    }
+    if donde:
+        cuerpo["location"] = donde
+    e = calendar_api(email, "POST", "/calendars/primary/events", json=cuerpo)
+    return {"ok": True, "id": e.get("id"), "titulo": titulo,
+            "desde": ini, "hasta": fin_iso, "link": e.get("htmlLink", "")}
+
 # ---- Limpieza de casilla, con permiso explicito de Bernardo ----
 
 def cargar_pendientes():
@@ -359,7 +456,7 @@ def proponer_limpieza(cuenta, ids, accion, turno):
 
     pid = pysecrets.token_urlsafe(8)
     pend = cargar_pendientes()
-    pend[pid] = {"cuenta": cuenta, "ids": ids, "accion": accion, "turno": turno,
+    pend[pid] = {"tipo": "mail", "cuenta": cuenta, "ids": ids, "accion": accion, "turno": turno,
                  "creada": datetime.now().strftime("%d/%m/%Y %H:%M")}
     guardar_pendientes(pend)
 
@@ -376,14 +473,46 @@ def proponer_limpieza(cuenta, ids, accion, turno):
         ),
     }
 
-def confirmar_limpieza(propuesta_id, turno):
+def proponer_cancelar_evento(cuenta, evento_id, turno):
+    """Prepara la cancelacion de un evento. NO lo borra todavia."""
+    if not evento_id:
+        return {"error": "Falta el id del evento. Primero buscalo con ver_agenda."}
+    try:
+        e = calendar_api(cuenta, "GET", f"/calendars/primary/events/{evento_id}")
+    except Exception as ex:
+        return {"error": f"No encontre ese evento: {ex}"}
+    ini = e.get("start", {})
+    detalle = {"titulo": e.get("summary", "(sin titulo)"),
+               "desde": ini.get("dateTime") or ini.get("date"),
+               "donde": e.get("location", "")}
+
+    pid = pysecrets.token_urlsafe(8)
+    pend = cargar_pendientes()
+    pend[pid] = {"tipo": "evento", "cuenta": cuenta, "evento_id": evento_id, "turno": turno,
+                 "detalle": detalle, "creada": datetime.now().strftime("%d/%m/%Y %H:%M")}
+    guardar_pendientes(pend)
+    return {"propuesta_id": pid, "evento": detalle,
+            "instruccion": ("NO esta cancelado todavia. Mostrale el evento a Bernardo y pedile "
+                            f"permiso. Solo si dice que si, en su PROXIMO mensaje, llama a "
+                            f"confirmar_accion con propuesta_id={pid}.")}
+
+def confirmar_accion(propuesta_id, turno):
     pend = cargar_pendientes()
     p = pend.get(propuesta_id)
     if not p:
         return {"error": "Esa propuesta no existe o ya se uso. Volve a proponerla."}
-    # Candado real: solo se puede confirmar despues de que Bernardo escribio de nuevo.
+    # Candado real: solo se puede confirmar despues de que el usuario escribio de nuevo.
     if turno <= p["turno"]:
-        return {"error": "Todavia no. Primero mostrale la lista a Bernardo y espera que el confirme."}
+        return {"error": "Todavia no. Primero mostrale el detalle y espera que confirme."}
+
+    if p.get("tipo") == "evento":
+        try:
+            calendar_api(p["cuenta"], "DELETE", f"/calendars/primary/events/{p['evento_id']}")
+        except Exception as e:
+            return {"error": f"No pude cancelarlo: {e}"}
+        pend.pop(propuesta_id, None)
+        guardar_pendientes(pend)
+        return {"ok": True, "cancelado": p.get("detalle", {}).get("titulo", "el evento")}
 
     cuenta, ids, accion = p["cuenta"], p["ids"], p["accion"]
     hechos, fallados = [], []
@@ -405,6 +534,124 @@ def confirmar_limpieza(propuesta_id, turno):
             "Salieron de la bandeja de entrada, pero siguen en 'Todos los mensajes'.")
     return {"ok": True, "accion": accion, "movidos": len(hechos),
             "fallados": len(fallados), "nota": nota}
+
+# =====================================================================
+# CONTACTOS DE WHATSAPP Y RECADOS
+# =====================================================================
+
+def solo_digitos(n):
+    return "".join(ch for ch in (n or "") if ch.isdigit())
+
+def cargar_contactos():
+    if os.path.exists(CONTACTOS_FILE):
+        try:
+            with open(CONTACTOS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def guardar_contactos(d):
+    with open(CONTACTOS_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+def quien_es(numero):
+    """Devuelve (nombre, rol) o (None, None) si el numero no esta autorizado."""
+    c = cargar_contactos().get(solo_digitos(numero))
+    if not c:
+        return None, None
+    return c.get("nombre", "Alguien"), c.get("rol", "invitado")
+
+def cargar_mensajes():
+    if os.path.exists(MENSAJES_FILE):
+        try:
+            with open(MENSAJES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def dejar_mensaje(de, texto):
+    if not (texto or "").strip():
+        return {"error": "El mensaje esta vacio."}
+    msgs = cargar_mensajes()
+    msgs.insert(0, {"de": de, "texto": texto.strip(),
+                    "cuando": datetime.now(ZoneInfo(ZONA)).strftime("%d/%m/%Y %H:%M"),
+                    "leido": False})
+    with open(MENSAJES_FILE, "w", encoding="utf-8") as f:
+        json.dump(msgs[:200], f, ensure_ascii=False, indent=2)
+    return {"ok": True, "nota": f"Recado guardado. Bernardo lo va a ver de parte de {de}."}
+
+def ver_mensajes(marcar_leidos=True):
+    msgs = cargar_mensajes()
+    pendientes = [m for m in msgs if not m.get("leido")]
+    if marcar_leidos and pendientes:
+        for m in msgs:
+            m["leido"] = True
+        with open(MENSAJES_FILE, "w", encoding="utf-8") as f:
+            json.dump(msgs, f, ensure_ascii=False, indent=2)
+    return {"sin_leer": pendientes, "cantidad": len(pendientes)}
+
+# =====================================================================
+# WHATSAPP (Meta Cloud API)
+# =====================================================================
+
+def wa_configurado():
+    return bool(WA_TOKEN and WA_PHONE_ID)
+
+def wa_enviar(numero, texto):
+    """Manda un mensaje de texto por WhatsApp. Devuelve True si salio bien."""
+    if not wa_configurado():
+        return False
+    # WhatsApp corta los mensajes largos: los partimos en pedazos de 3500.
+    partes = [texto[i:i + 3500] for i in range(0, len(texto), 3500)] or [""]
+    ok = True
+    for parte in partes:
+        try:
+            r = httpx.post(
+                f"{WA_API}/{WA_PHONE_ID}/messages",
+                headers={"Authorization": f"Bearer {WA_TOKEN}",
+                         "Content-Type": "application/json"},
+                json={"messaging_product": "whatsapp", "to": solo_digitos(numero),
+                      "type": "text", "text": {"preview_url": False, "body": parte}},
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                print(f"[wa] error {r.status_code}: {r.text[:300]}")
+                ok = False
+        except Exception as e:
+            print(f"[wa] excepcion al enviar: {e}")
+            ok = False
+    return ok
+
+# Ids ya procesados: Meta reintenta el mismo mensaje si no contestamos rapido.
+WA_VISTOS = []
+
+def wa_ya_visto(mid):
+    if not mid:
+        return False
+    if mid in WA_VISTOS:
+        return True
+    WA_VISTOS.append(mid)
+    del WA_VISTOS[:-200]
+    return False
+
+def archivo_chat_de(nombre, rol):
+    """Bernardo comparte la memoria con la web. Cada invitado tiene su propio hilo."""
+    if rol == "dueno":
+        return ARCHIVO_MEMORIA
+    os.makedirs(CARPETA_CHATS, exist_ok=True)
+    slug = "".join(ch for ch in nombre.lower() if ch.isalnum()) or "invitado"
+    return os.path.join(CARPETA_CHATS, f"{slug}.json")
+
+def wa_procesar(numero, texto, nombre, rol):
+    """Corre en segundo plano: piensa la respuesta y la manda de vuelta."""
+    try:
+        respuesta, _ = responder_conversacion(texto, archivo_chat_de(nombre, rol), nombre, rol)
+    except Exception as e:
+        print(f"[wa] error al responder: {e}")
+        respuesta = "Se me complico procesar eso. Probemos de nuevo en un momento."
+    wa_enviar(numero, respuesta)
 
 # ---- Herramientas que HONEY puede usar ----
 
@@ -481,30 +728,121 @@ HERRAMIENTAS = [
         },
     },
     {
-        "name": "confirmar_limpieza",
+        "name": "ver_agenda",
         "description": (
-            "PASO 2 de 2. Ejecuta una propuesta que Bernardo YA autorizo explicitamente. "
-            "Solo se puede usar despues de que el respondio que si. Si la llamas antes, va a fallar."
+            "Mira el calendario de Bernardo. Devuelve los eventos de un rango, ordenados. "
+            "Sirve tanto para contarle su dia como para ver si esta libre en un horario. "
+            "Si no pasas 'desde', arranca desde ahora."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "propuesta_id": {"type": "string", "description": "El id que devolvio proponer_limpieza."},
+                "cuenta": {"type": "string"},
+                "desde": {"type": "string", "description": "Fecha AAAA-MM-DD (o AAAA-MM-DDTHH:MM). Opcional."},
+                "dias": {"type": "integer", "description": "Cuantos dias mirar desde esa fecha (1 a 60). Por defecto 7."},
+            },
+            "required": ["cuenta"],
+        },
+    },
+    {
+        "name": "crear_evento",
+        "description": (
+            "Agenda un evento nuevo en el calendario de Bernardo. Antes de agendar algo, fijate con "
+            "ver_agenda que no se pise con otra cosa, y si se pisa avisale. Usa la hora de Argentina."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cuenta": {"type": "string"},
+                "titulo": {"type": "string"},
+                "inicio": {"type": "string", "description": "AAAA-MM-DDTHH:MM (hora de Argentina)."},
+                "fin": {"type": "string", "description": "AAAA-MM-DDTHH:MM. Si no lo pasas, dura 1 hora."},
+                "descripcion": {"type": "string"},
+                "donde": {"type": "string", "description": "Lugar. Opcional."},
+            },
+            "required": ["cuenta", "titulo", "inicio"],
+        },
+    },
+    {
+        "name": "proponer_cancelar_evento",
+        "description": (
+            "PASO 1 de 2 para cancelar un evento. Prepara la cancelacion y devuelve el detalle, "
+            "pero NO lo borra. Despues mostraselo a Bernardo y pedile permiso."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cuenta": {"type": "string"},
+                "evento_id": {"type": "string", "description": "Id del evento, sacado de ver_agenda."},
+            },
+            "required": ["cuenta", "evento_id"],
+        },
+    },
+    {
+        "name": "dejar_mensaje",
+        "description": (
+            "Deja un recado para Bernardo. Usalo cuando alguien que NO es Bernardo quiere avisarle algo, "
+            "pedirle algo o dejarle una nota. Bernardo lo ve despues en su chat. "
+            "No sirve para agendar: para eso usa crear_evento."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "texto": {"type": "string", "description": "El recado, con lo esencial."},
+            },
+            "required": ["texto"],
+        },
+    },
+    {
+        "name": "ver_mensajes",
+        "description": (
+            "Mira si quedaron recados sin leer para Bernardo (por ejemplo de Mariana por WhatsApp). "
+            "Usalo cuando el pregunte si le dejaron algo, o al empezar el dia."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "confirmar_accion",
+        "description": (
+            "PASO 2 de 2. Ejecuta una propuesta (limpieza de mails o cancelacion de evento) que "
+            "Bernardo YA autorizo explicitamente. Solo funciona despues de que el respondio que si."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "propuesta_id": {"type": "string", "description": "El id que devolvio la propuesta."},
             },
             "required": ["propuesta_id"],
         },
     },
 ]
 
-def ejecutar_herramienta(nombre, args, turno=0):
+# Que puede hacer cada quien.
+HERRAMIENTAS_INVITADO = ("ver_agenda", "crear_evento", "dejar_mensaje")
+
+def herramientas_para(rol):
+    if rol == "dueno":
+        return [t for t in HERRAMIENTAS if t["name"] != "dejar_mensaje"]
+    return [t for t in HERRAMIENTAS if t["name"] in HERRAMIENTAS_INVITADO]
+
+def ejecutar_herramienta(nombre, args, turno=0, quien="Bernardo", rol="dueno"):
     try:
-        if nombre == "confirmar_limpieza":
-            return confirmar_limpieza(args.get("propuesta_id", ""), turno)
+        # Candado de permisos: un invitado no puede usar nada fuera de su lista.
+        if rol != "dueno" and nombre not in HERRAMIENTAS_INVITADO:
+            return {"error": "No tenes permiso para eso. Solo agenda y dejar recados."}
+
+        if nombre == "dejar_mensaje":
+            return dejar_mensaje(quien, args.get("texto", ""))
+        if nombre == "ver_mensajes":
+            return ver_mensajes()
+        if nombre in ("confirmar_accion", "confirmar_limpieza"):
+            return confirmar_accion(args.get("propuesta_id", ""), turno)
 
         cuentas = list(cargar_cuentas().keys())
         if not cuentas:
             return {"error": "No hay ninguna cuenta de Google conectada todavia."}
-        cuenta = args.get("cuenta") or cuentas[0]
+        # Un invitado nunca elige cuenta: siempre la principal de Bernardo.
+        cuenta = cuentas[0] if rol != "dueno" else (args.get("cuenta") or cuentas[0])
         if cuenta not in cuentas:
             return {"error": f"La cuenta '{cuenta}' no esta conectada. Conectadas: {', '.join(cuentas)}"}
 
@@ -522,6 +860,15 @@ def ejecutar_herramienta(nombre, args, turno=0):
             )
         if nombre == "proponer_limpieza":
             return proponer_limpieza(cuenta, args.get("ids"), args.get("accion", ""), turno)
+        if nombre == "ver_agenda":
+            return {"eventos": cal_listar(cuenta, args.get("desde", ""), args.get("dias", 7))}
+        if nombre == "crear_evento":
+            return cal_crear(cuenta, args.get("titulo", ""), args.get("inicio", ""),
+                             args.get("fin", ""), args.get("descripcion", ""),
+                             args.get("donde", ""),
+                             creado_por=(quien if quien != "Bernardo" else ""))
+        if nombre == "proponer_cancelar_evento":
+            return proponer_cancelar_evento(cuenta, args.get("evento_id", ""), turno)
         return {"error": f"Herramienta desconocida: {nombre}"}
     except Exception as e:
         return {"error": str(e)}
@@ -561,7 +908,16 @@ def system_completo():
               "2) Recien cuando el conteste que si, llamas a confirmar_limpieza con el propuesta_id.\n"
               "Nunca hagas los dos pasos en el mismo mensaje: el sistema lo rechaza igual.\n"
               "Ante la duda de si un mail le sirve, no lo incluyas y preguntale.\n"
-              "No podes borrar nada de forma permanente, y esta bien que sea asi.")
+              "No podes borrar nada de forma permanente, y esta bien que sea asi.\n"
+              "\n===== AGENDA =====\n"
+              "Tenes acceso al Google Calendar de Bernardo (hora de Argentina).\n"
+              "- Para contarle el dia o ver si esta libre, usa ver_agenda.\n"
+              "- Antes de agendar algo, fijate que no se pise con otro evento. Si se pisa, avisale.\n"
+              "- Al crear un evento, confirmale dia, hora y titulo en la respuesta.\n"
+              "- Para cancelar es en dos pasos: proponer_cancelar_evento, le pedis permiso, "
+              "y recien con su OK llamas a confirmar_accion.\n"
+              "- Si te da una fecha vaga ('el jueves', 'manana a la tarde'), calculala vos con la "
+              "fecha de hoy que figura mas abajo, y confirmasela al pasar.")
     elif google_configurado():
         s += ("\n\n===== CORREO =====\n"
               "Todavia no hay ninguna casilla conectada. Si Bernardo pregunta por sus mails, "
@@ -570,15 +926,94 @@ def system_completo():
     s += contexto_fecha()
     return s
 
-def cargar_historial():
-    if os.path.exists(ARCHIVO_MEMORIA):
-        with open(ARCHIVO_MEMORIA, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return [m for m in data if m["role"] != "system"]
+PROMPT_INVITADO = """Sos HONEY, el asistente personal de Bernardo Diaz.
+
+Ahora NO estas hablando con Bernardo, sino con {nombre}, una persona de su confianza a la que el
+le dio acceso limitado. Tratala con calidez y cortesia, de "vos", en espanol.
+
+QUE PODES HACER CON {nombre}
+- Mirar la agenda de Bernardo para decirle si esta libre u ocupado en un horario.
+- Agendarle cosas en el calendario (siempre queda registrado que las agendo {nombre}).
+- Tomarle un recado para Bernardo, que el va a ver despues.
+
+QUE NO PODES HACER (y no se negocia)
+- NO podes leer, buscar, resumir ni tocar los mails de Bernardo. Ni un asunto, ni un remitente.
+- NO podes contar detalles privados de Bernardo, ni de su trabajo, ni de sus otras conversaciones.
+- NO podes cancelar ni borrar eventos existentes.
+- Si {nombre} te pide algo de eso, decile con amabilidad que eso solo lo maneja Bernardo,
+  y ofrecele dejarle un recado. Nunca te enojes ni la hagas sentir mal.
+
+SOBRE LA AGENDA
+- Al decir si esta libre, se discreta: deci "esta ocupado de 15 a 17" y no de que se trata,
+  salvo que sea claramente algo compartido entre ellos.
+- Antes de agendar, fijate que no se pise con otra cosa. Si se pisa, avisale.
+- Cuando agendes, confirmale dia, hora y titulo.
+- Si te da una fecha vaga, calculala con la fecha de hoy y confirmasela.
+
+TU ESTILO
+Sos sereno y breve, pero calido. No usas emojis. Si algo no lo podes hacer, lo decis simple
+y ofreces la alternativa."""
+
+def system_invitado(nombre):
+    return PROMPT_INVITADO.format(nombre=nombre) + contexto_fecha()
+
+def responder_conversacion(texto_usuario, archivo_memoria, quien="Bernardo", rol="dueno"):
+    """El motor: arma el contexto, deja que HONEY use herramientas y devuelve la respuesta."""
+    h = cargar_historial(archivo_memoria)
+    h.append({"role": "user", "content": texto_usuario})
+    turno = len(h)
+
+    sistema = system_completo() if rol == "dueno" else system_invitado(quien)
+    hay_cuentas = bool(cargar_cuentas())
+    tools = herramientas_para(rol) if hay_cuentas else []
+    mensajes = historial_para_api(h)
+    usadas = []
+    texto = ""
+
+    for _ in range(6):
+        kw = {"model": "claude-haiku-4-5", "max_tokens": 2048,
+              "system": sistema, "messages": mensajes}
+        if tools:
+            kw["tools"] = tools
+        r = client.messages.create(**kw)
+
+        if r.stop_reason != "tool_use":
+            texto = "".join(b.text for b in r.content if b.type == "text").strip()
+            break
+
+        mensajes = mensajes + [{"role": "assistant", "content": [b.model_dump() for b in r.content]}]
+        resultados = []
+        for b in r.content:
+            if b.type == "tool_use":
+                usadas.append(b.name)
+                salida = ejecutar_herramienta(b.name, b.input or {}, turno, quien, rol)
+                resultados.append({"type": "tool_result", "tool_use_id": b.id,
+                                   "content": json.dumps(salida, ensure_ascii=False)[:60000]})
+        mensajes = mensajes + [{"role": "user", "content": resultados}]
+    else:
+        texto = "Me quede dando vueltas con la consulta. Probemos de nuevo con algo mas puntual."
+
+    if not texto:
+        texto = "No obtuve respuesta. Intentemos de nuevo."
+
+    h.append({"role": "assistant", "content": texto})
+    guardar_historial(h, archivo_memoria)
+    return texto, usadas
+
+def cargar_historial(archivo=None):
+    archivo = archivo or ARCHIVO_MEMORIA
+    if os.path.exists(archivo):
+        try:
+            with open(archivo, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return [m for m in data if m["role"] != "system"]
+        except Exception:
+            return []
     return []
 
-def guardar_historial(h):
-    with open(ARCHIVO_MEMORIA, "w", encoding="utf-8") as f:
+def guardar_historial(h, archivo=None):
+    archivo = archivo or ARCHIVO_MEMORIA
+    with open(archivo, "w", encoding="utf-8") as f:
         json.dump(h, f, ensure_ascii=False, indent=2)
 
 def historial_para_api(h):
@@ -781,57 +1216,88 @@ async def post_perfil(data: Perfil, usuario: str = Depends(requerir_login)):
 
 @app.post("/chat")
 async def chat(mensaje: Mensaje, usuario: str = Depends(requerir_login)):
-    h = cargar_historial()
-    h.append({"role": "user", "content": mensaje.texto})
-
-    hay_cuentas = bool(cargar_cuentas())
-    mensajes = historial_para_api(h)
-    sistema = system_completo()
-    usadas = []
-    # "turno" crece con cada mensaje de Bernardo: es el candado de las confirmaciones.
-    turno = len(h)
-
-    # Bucle de herramientas: HONEY puede pedir datos (mails) antes de responder.
-    for _ in range(6):
-        kw = {
-            "model": "claude-haiku-4-5",
-            "max_tokens": 2048,
-            "system": sistema,
-            "messages": mensajes,
-        }
-        if hay_cuentas:
-            kw["tools"] = HERRAMIENTAS
-        r = client.messages.create(**kw)
-
-        if r.stop_reason != "tool_use":
-            texto = "".join(b.text for b in r.content if b.type == "text").strip()
-            break
-
-        mensajes = mensajes + [{"role": "assistant", "content": [b.model_dump() for b in r.content]}]
-        resultados = []
-        for b in r.content:
-            if b.type == "tool_use":
-                usadas.append(b.name)
-                salida = ejecutar_herramienta(b.name, b.input or {}, turno)
-                resultados.append({
-                    "type": "tool_result",
-                    "tool_use_id": b.id,
-                    "content": json.dumps(salida, ensure_ascii=False)[:60000],
-                })
-        mensajes = mensajes + [{"role": "user", "content": resultados}]
-    else:
-        texto = "Me quede dando vueltas con la consulta, senor. Probemos de nuevo con algo mas puntual."
-
-    if not texto:
-        texto = "No obtuve respuesta. Intentemos de nuevo."
-
-    h.append({"role": "assistant", "content": texto})
-    guardar_historial(h)
+    # La web siempre es Bernardo (ya paso por el login) y usa la memoria principal.
+    texto, usadas = responder_conversacion(mensaje.texto, ARCHIVO_MEMORIA, "Bernardo", "dueno")
     return {"respuesta": texto, "herramientas": usadas}
 
 @app.get("/historial")
 async def historial(usuario: str = Depends(requerir_login)):
     return cargar_historial()
+
+# ---------------- WHATSAPP ----------------
+@app.get("/whatsapp/webhook")
+async def wa_verificar(request: Request):
+    """Meta llama esto una sola vez para comprobar que el webhook es nuestro."""
+    p = request.query_params
+    if p.get("hub.mode") == "subscribe" and p.get("hub.verify_token") == WA_VERIFY_TOKEN:
+        return PlainTextResponse(p.get("hub.challenge", ""))
+    return PlainTextResponse("no", status_code=403)
+
+@app.post("/whatsapp/webhook")
+async def wa_recibir(request: Request, tareas: BackgroundTasks):
+    # Siempre devolvemos 200: si Meta no recibe el OK rapido, reintenta y duplica.
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    for entrada in data.get("entry", []):
+        for cambio in entrada.get("changes", []):
+            valor = cambio.get("value", {})
+            for m in valor.get("messages", []):
+                if wa_ya_visto(m.get("id")):
+                    continue
+                numero = m.get("from", "")
+                nombre, rol = quien_es(numero)
+                # Numero desconocido: no se contesta nada. HONEY no habla con extranos.
+                if not nombre:
+                    print(f"[wa] mensaje ignorado de numero no autorizado: {numero[-4:]}")
+                    continue
+                if m.get("type") != "text":
+                    tareas.add_task(wa_enviar, numero,
+                                    "Por ahora solo puedo leer mensajes de texto.")
+                    continue
+                texto = (m.get("text") or {}).get("body", "").strip()
+                if not texto:
+                    continue
+                tareas.add_task(wa_procesar, numero, texto, nombre, rol)
+    return {"ok": True}
+
+class Contacto(BaseModel):
+    numero: str
+    nombre: str
+    rol: str = "invitado"
+
+@app.get("/whatsapp/contactos")
+async def wa_contactos(usuario: str = Depends(requerir_login)):
+    c = cargar_contactos()
+    lista = [{"numero": n, **v} for n, v in c.items()]
+    return {"configurado": wa_configurado(), "contactos": lista}
+
+@app.post("/whatsapp/contactos")
+async def wa_agregar_contacto(c: Contacto, usuario: str = Depends(requerir_login)):
+    numero = solo_digitos(c.numero)
+    if len(numero) < 8:
+        return {"error": "Ese numero no parece valido. Poné el codigo de pais, sin + ni espacios."}
+    if not c.nombre.strip():
+        return {"error": "Falta el nombre."}
+    rol = "dueno" if c.rol == "dueno" else "invitado"
+    d = cargar_contactos()
+    d[numero] = {"nombre": c.nombre.strip(), "rol": rol}
+    guardar_contactos(d)
+    return {"ok": True}
+
+@app.post("/whatsapp/contactos/borrar")
+async def wa_borrar_contacto(c: Contacto, usuario: str = Depends(requerir_login)):
+    d = cargar_contactos()
+    d.pop(solo_digitos(c.numero), None)
+    guardar_contactos(d)
+    return {"ok": True}
+
+@app.get("/recados")
+async def recados(usuario: str = Depends(requerir_login)):
+    msgs = cargar_mensajes()
+    return {"mensajes": msgs[:50], "sin_leer": len([m for m in msgs if not m.get("leido")])}
 
 @app.post("/upload")
 async def upload(archivo: UploadFile = File(...), usuario: str = Depends(requerir_login)):
@@ -950,6 +1416,13 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
 #voz-select:focus { border-color: var(--amarillo); }
 .btn-probar { background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: #C8B890; font-size: 12.5px; font-weight: 600; padding: 8px; cursor: pointer; text-align: center; }
 .btn-probar:active { border-color: var(--amarillo); color: var(--amarillo); }
+.wa-area { padding: 10px; border-bottom: 1px solid var(--borde); display: flex; flex-direction: column; gap: 6px; }
+.wa-area input, .wa-area select { background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: var(--texto); font-size: 12.5px; padding: 8px 9px; width: 100%; outline: none; font-family: inherit; }
+.wa-area input:focus, .wa-area select:focus { border-color: var(--amarillo); }
+.wa-item { display: flex; align-items: center; gap: 6px; background: #12180F; border: 1px solid #2A4A2A; border-radius: 8px; padding: 8px 10px; }
+.wa-item .quien { flex: 1; font-size: 12px; color: #9CCB8F; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wa-item .rol { font-size: 10px; color: #6A6458; }
+.wa-item .x { background: none; border: none; color: #6A6458; font-size: 16px; cursor: pointer; padding: 0 2px; }
 .sheet-input-area { padding: 10px; border-bottom: 1px solid var(--borde); display: flex; flex-direction: column; gap: 6px; }
 #sheet-url { background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: var(--texto); font-size: 14px; padding: 9px 10px; width: 100%; outline: none; font-family: inherit; }
 #sheet-url:focus { border-color: var(--amarillo); }
@@ -1032,6 +1505,17 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
     <div class="voz-area">
       <select id="voz-select" onchange="elegirVoz()"></select>
       <div class="btn-probar" onclick="probarVoz()">Probar voz</div>
+    </div>
+    <div class="sidebar-section"><span>WhatsApp</span></div>
+    <div class="wa-area">
+      <div id="wa-lista"></div>
+      <input id="wa-numero" placeholder="Numero con pais (5491122334455)">
+      <input id="wa-nombre" placeholder="Nombre">
+      <select id="wa-rol">
+        <option value="invitado">Invitado (agenda y recados)</option>
+        <option value="dueno">Yo (acceso total)</option>
+      </select>
+      <div class="btn-probar" onclick="agregarContacto()">Autorizar numero</div>
     </div>
     <div class="sidebar-section"><span>Archivos</span></div>
     <div id="archivos-lista"><div class="sin-archivos">Todavia no subiste archivos</div></div>
@@ -1353,6 +1837,50 @@ async function desconectarCuenta(cuenta) {
   } catch(e) {}
 }
 
+async function cargarContactos() {
+  const cont = document.getElementById('wa-lista');
+  try {
+    const r = await req('/whatsapp/contactos');
+    const d = await r.json();
+    if (!d.configurado) {
+      cont.innerHTML = '<div class="sin-cuentas">Falta configurar WhatsApp en el servidor.</div>';
+      return;
+    }
+    if (!d.contactos.length) {
+      cont.innerHTML = '<div class="sin-cuentas">Ningun numero autorizado. Solo estos numeros pueden hablarle a HONEY.</div>';
+      return;
+    }
+    cont.innerHTML = d.contactos.map(c =>
+      '<div class="wa-item"><div class="quien">' + c.nombre +
+      '<div class="rol">' + (c.rol === 'dueno' ? 'acceso total' : 'agenda y recados') + '</div></div>' +
+      '<button class="x" title="Quitar" onclick="borrarContacto(\\'' + c.numero + '\\',\\'' + c.nombre + '\\')">&times;</button></div>'
+    ).join('');
+  } catch(e) {}
+}
+
+async function agregarContacto() {
+  const numero = document.getElementById('wa-numero').value.trim();
+  const nombre = document.getElementById('wa-nombre').value.trim();
+  const rol = document.getElementById('wa-rol').value;
+  if (!numero || !nombre) { alert('Falta el numero o el nombre.'); return; }
+  try {
+    const r = await req('/whatsapp/contactos', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({numero, nombre, rol})});
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    document.getElementById('wa-numero').value = '';
+    document.getElementById('wa-nombre').value = '';
+    cargarContactos();
+  } catch(e) {}
+}
+
+async function borrarContacto(numero, nombre) {
+  if (!confirm('Sacarle el acceso a ' + nombre + '?')) return;
+  try {
+    await req('/whatsapp/contactos/borrar', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({numero, nombre:'x'})});
+    cargarContactos();
+  } catch(e) {}
+}
+
 (function avisoConexion() {
   const p = new URLSearchParams(window.location.search).get('conectado');
   if (p) {
@@ -1364,6 +1892,7 @@ async function desconectarCuenta(cuenta) {
 cargarHistorial();
 cargarListaArchivos();
 cargarCuentas();
+cargarContactos();
 </script>
 </body>
 </html>"""
