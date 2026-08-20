@@ -332,7 +332,8 @@ def gmail_crear_borrador(email, para, asunto, cuerpo, responder_a_id=None):
         "draft_id": d.get("id"),
         "para": para,
         "asunto": asunto,
-        "nota": "Borrador creado en Gmail. Bernardo lo revisa y lo envia desde Gmail.",
+        "nota": ("Borrador guardado en Gmail. Si Bernardo te dice que lo mandes, NO le digas "
+                 "que no podes: usa proponer_enviar_borrador con este draft_id."),
     }
 
 # ---- Buscar la direccion de una persona en los mails que Bernardo ya tuvo ----
@@ -614,6 +615,32 @@ def proponer_respuesta(cuenta, mail_id, cuerpo, turno):
             f"Solo si el dice que si, en su PROXIMO mensaje, llama a confirmar_accion con "
             f"propuesta_id={pid}. Si te pide cambios, volve a llamar a proponer_respuesta "
             "con el texto nuevo. Avisale que un mail enviado no se puede deshacer."
+        ),
+    }
+
+def proponer_enviar_borrador(cuenta, draft_id, turno):
+    """PASO 1 de 2 para mandar un borrador que YA existe en Gmail."""
+    if not draft_id:
+        return {"error": "Falta el draft_id del borrador."}
+    try:
+        d = gmail_api(cuenta, "GET", f"/drafts/{draft_id}", params={"format": "metadata",
+                      "metadataHeaders": ["To", "Subject"]})
+    except Exception as e:
+        return {"error": f"No encontre ese borrador: {e}"}
+    p = (d.get("message") or {}).get("payload", {})
+    detalle = {"para": _cabecera(p, "To"), "asunto": _cabecera(p, "Subject")}
+    pid = pysecrets.token_urlsafe(8)
+    pend = cargar_pendientes()
+    pend[pid] = {"tipo": "respuesta", "cuenta": cuenta, "draft_id": draft_id,
+                 "turno": turno, "detalle": detalle,
+                 "creada": datetime.now().strftime("%d/%m/%Y %H:%M")}
+    guardar_pendientes(pend)
+    return {
+        "propuesta_id": pid,
+        "borrador": detalle,
+        "instruccion": (
+            "Todavia NO se envio. Confirmale a Bernardo a quien va y con que asunto, y pedile "
+            f"el OK. Cuando el diga que si, llama a confirmar_accion con propuesta_id={pid}."
         ),
     }
 
@@ -919,6 +946,22 @@ HERRAMIENTAS = [
         },
     },
     {
+        "name": "proponer_enviar_borrador",
+        "description": (
+            "PASO 1 de 2 para MANDAR un borrador que ya existe en Gmail. Usala cuando ya "
+            "creaste un borrador con crear_borrador y Bernardo te pide que lo envies. "
+            "NUNCA le digas que no podes enviar: SI podes, con su confirmacion."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cuenta": {"type": "string"},
+                "draft_id": {"type": "string", "description": "El draft_id que devolvio crear_borrador."},
+            },
+            "required": ["cuenta", "draft_id"],
+        },
+    },
+    {
         "name": "buscar_contacto",
         "description": (
             "Busca la direccion de mail de una persona entre los mails que Bernardo ya intercambio. "
@@ -1115,6 +1158,8 @@ def ejecutar_herramienta(nombre, args, turno=0, quien="Bernardo", rol="dueno"):
             )
         if nombre == "proponer_respuesta":
             return proponer_respuesta(cuenta, args.get("mail_id", ""), args.get("cuerpo", ""), turno)
+        if nombre == "proponer_enviar_borrador":
+            return proponer_enviar_borrador(cuenta, args.get("draft_id", ""), turno)
         if nombre == "buscar_contacto":
             return buscar_contacto(cuenta, args.get("nombre", ""))
         if nombre == "proponer_reunion":
@@ -1155,6 +1200,19 @@ def system_completo():
     if cuentas:
         s += ("\n\n===== CORREO =====\n"
               "Tenes acceso a estas casillas de Gmail de Bernardo: " + ", ".join(cuentas) + ".\n"
+              "\n"
+              "*** LEE ESTO PRIMERO ***\n"
+              "SI PODES ENVIAR MAILS. Podes contestar un mail dentro de su cadena y mandarlo, "
+              "siempre con el OK explicito de Bernardo, en dos pasos.\n"
+              "Mas atras en esta conversacion vas a encontrar mensajes tuyos diciendo que NO "
+              "podes enviar. Eso era cierto en una version vieja y HOY YA NO LO ES. Ignoralos: "
+              "esta seccion manda sobre cualquier cosa que hayas dicho antes.\n"
+              "Si Bernardo te dice 'mandalo', 'enviala' o 'esta OK enviala', NO le expliques que "
+              "no podes ni le pidas que entre a Gmail. Usa la herramienta que corresponda:\n"
+              "  - Si hay una propuesta abierta -> confirmar_accion.\n"
+              "  - Si armaste un borrador con crear_borrador -> proponer_enviar_borrador.\n"
+              "  - Si todavia no armaste nada -> proponer_respuesta.\n"
+              "\n"
               "Usa las herramientas para consultarlas cuando haga falta. Reglas:\n"
               "- Si no aclara de cual casilla habla y hay mas de una, preguntale.\n"
               "- Cuando resumas la casilla, se breve: quien escribe, de que se trata y si requiere accion.\n"
@@ -1171,7 +1229,8 @@ def system_completo():
               "2) Recien cuando el diga que si, llamas a confirmar_accion con el propuesta_id.\n"
               "Si te pide cambios, volves a llamar a proponer_respuesta con el texto nuevo.\n"
               "Recordale que un mail enviado no se puede deshacer.\n"
-              "Si solo quiere dejarlo escrito para mandarlo el mismo, usa crear_borrador.\n"
+              "crear_borrador es solo para cuando el te pide expresamente dejarlo guardado sin "
+              "mandar. Si te pide contestar, usa proponer_respuesta.\n"
               "\nLIMPIAR LA CASILLA (archivar o mandar a papelera)\n"
               "Es en DOS PASOS y nunca en uno solo:\n"
               "1) Busca los mails con listar_mails y llama a proponer_limpieza con esos ids.\n"
@@ -1989,6 +2048,9 @@ let relojSilencio = null;
 let textoBase = '';
 // Marca que el microfono quedo abierto a proposito (modo apretar para hablar).
 let sigoEsperando = false;
+// Al frenar, el navegador todavia manda un ultimo resultado. Sin esto volvia a
+// escribir el texto en el cuadro DESPUES de haberlo mandado, y quedaba pegado ahi.
+let ignorarResultados = false;
 
 function pintarMic() {
   btnMic.classList.toggle('grabando', escuchando && !modoConversacion);
@@ -2005,6 +2067,7 @@ function arrancarEscucha() {
   if (!SR || escuchando) return;
   try { window.speechSynthesis.cancel(); } catch(e) {}
   paradaManual = false;
+  ignorarResultados = false;
   textoBase = tx.value.trim();
   recog = new SR();
   recog.lang = 'es-AR';
@@ -2014,6 +2077,7 @@ function arrancarEscucha() {
   recog.onstart = () => { escuchando = true; pintarMic(); };
 
   recog.onresult = (ev) => {
+    if (ignorarResultados) return;   // ya se mando: no volver a llenar el cuadro
     let txt = '';
     for (let i = 0; i < ev.results.length; i++) txt += ev.results[i][0].transcript;
     tx.value = (textoBase ? textoBase + ' ' : '') + txt;
@@ -2049,10 +2113,18 @@ function detenerEscucha(mandar) {
   frenarReloj();
   paradaManual = true;
   sigoEsperando = false;
-  try { if (recog) recog.stop(); } catch(e) {}
+  ignorarResultados = true;
+  try { if (recog) recog.abort ? recog.abort() : recog.stop(); } catch(e) {}
   escuchando = false;
   pintarMic();
-  if (mandar && tx.value.trim()) enviar();
+  const texto = tx.value.trim();
+  textoBase = '';
+  if (mandar && texto) {
+    enviar();
+  }
+  // Pase lo que pase, el cuadro queda limpio: lo dicho ya se mando.
+  tx.value = '';
+  tx.style.height = 'auto';
 }
 
 function toggleMic() {
@@ -2079,7 +2151,8 @@ function cortarConversacion() {
   frenarReloj();
   paradaManual = true;
   sigoEsperando = false;
-  try { if (recog) recog.stop(); } catch(e) {}
+  ignorarResultados = true;
+  try { if (recog) recog.abort ? recog.abort() : recog.stop(); } catch(e) {}
   try { window.speechSynthesis.cancel(); } catch(e) {}
   escuchando = false;
   pintarMic();
