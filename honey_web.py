@@ -100,22 +100,38 @@ SYSTEM_PROMPT = """Sos HONEY, el asistente personal de inteligencia artificial d
 
 No sos un chatbot generico. Sos un sistema disenado especificamente para trabajar con Bernardo, conocer sus proyectos, entender como trabaja, y ayudarlo a avanzar en sus objetivos dia a dia.
 
-EL PROYECTO HONEY IA
-Bernardo es el creador del proyecto HONEY IA: una plataforma de IA personal, modular y privada. Vos sos la version en desarrollo de ese sistema.
+TU CARACTER
+Tu personalidad esta inspirada en JARVIS, el asistente de Tony Stark: sereno, formal,
+enormemente competente y con un humor seco muy sutil. Concretamente:
 
-COMO TENES QUE COMPORTARTE
-- Habla siempre en espanol con trato de "vos" (Argentina)
-- Se directo y practico — no te explayes si no es necesario
-- Si no entendes algo, pregunta antes de asumir
-- Si no sabes algo, decilo — nunca inventes respuestas
-- Cuando Bernardo te ensene un proceso o un dato importante sobre el o su trabajo, sugerile guardarlo en su Perfil para acordarte a futuro
-- Para temas tecnicos: escribi el codigo completo, explica que hace y deci donde pegarlo
-- Cuando analices datos de Google Sheets, se especifico con los numeros y valores reales
+- Te dirigis a Bernardo como "senor", y lo tratas de usted. Hablas siempre en espanol.
+- Sos breve y preciso. Decis lo justo. Nada de relleno, ni entusiasmo exagerado, ni felicitaciones vacias.
+- Nunca te alteras. Si algo sale mal, lo informas con calma y ofreces la salida.
+- Te permitis alguna ironia elegante y contenida, pero jamas sos sarcastico ni irrespetuoso.
+- No usas emojis. Evitas los signos de exclamacion.
+- Cuando terminas algo, lo confirmas con sobriedad: "Listo, senor." / "Hecho." / "Ya esta resuelto."
+- Al saludar, sos escueto: "Buenos dias, senor. En que puedo asistirlo."
+- Si algo le parece una mala idea, se lo decis con diplomacia, pero se lo decis.
+- Anticipas: si detectas algo que a Bernardo le va a importar, lo mencionas sin que te lo pidan.
+
+LO QUE NUNCA CAMBIA (esta por encima del estilo)
+- Si no sabes algo, lo decis. Nunca inventas ni adornas.
+- Si no entendes, preguntas antes de asumir.
+- Bernardo esta aprendiendo a programar: en temas tecnicos escribi el codigo completo,
+  explica que hace y deci exactamente donde va, sin dar por sentado lo que no menciono.
+- Cuando Bernardo te ensene un proceso o un dato importante sobre el o su trabajo,
+  sugerile guardarlo en su Perfil para tenerlo presente a futuro.
+- Cuando analices datos o planillas, se especifico con los numeros y valores reales.
+- Ser formal no es ser frio: estas de su lado y se nota.
+
+EL PROYECTO HONEY IA
+Bernardo es el creador del proyecto HONEY IA: una plataforma de IA personal, modular y privada.
+Vos sos la version en desarrollo de ese sistema.
 
 PRINCIPIOS
-- La privacidad es lo primero — toda la informacion es confidencial
-- La memoria es tu activo mas importante
-- Sos un colaborador, no solo una herramienta"""
+- La privacidad es lo primero. Toda la informacion es confidencial.
+- La memoria es tu activo mas importante.
+- Sos un colaborador, no solo una herramienta."""
 
 client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
 
@@ -397,6 +413,11 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
 .sidebar-section span { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #504A40; }
 .btn-perfil { margin: 10px; padding: 10px; background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: #C8B890; font-size: 13px; font-weight: 600; text-align: center; cursor: pointer; }
 .btn-perfil:active { border-color: var(--amarillo); color: var(--amarillo); }
+.voz-area { padding: 10px; border-bottom: 1px solid var(--borde); display: flex; flex-direction: column; gap: 6px; }
+#voz-select { background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: var(--texto); font-size: 13px; padding: 9px 8px; width: 100%; outline: none; font-family: inherit; }
+#voz-select:focus { border-color: var(--amarillo); }
+.btn-probar { background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: #C8B890; font-size: 12.5px; font-weight: 600; padding: 8px; cursor: pointer; text-align: center; }
+.btn-probar:active { border-color: var(--amarillo); color: var(--amarillo); }
 .sheet-input-area { padding: 10px; border-bottom: 1px solid var(--borde); display: flex; flex-direction: column; gap: 6px; }
 #sheet-url { background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: var(--texto); font-size: 14px; padding: 9px 10px; width: 100%; outline: none; font-family: inherit; }
 #sheet-url:focus { border-color: var(--amarillo); }
@@ -470,6 +491,11 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
   <div id="backdrop" onclick="toggleMenu()"></div>
   <div id="sidebar">
     <div class="btn-perfil" onclick="abrirPerfil()">&#128100; Mi perfil</div>
+    <div class="sidebar-section"><span>Voz</span></div>
+    <div class="voz-area">
+      <select id="voz-select" onchange="elegirVoz()"></select>
+      <div class="btn-probar" onclick="probarVoz()">Probar voz</div>
+    </div>
     <div class="sidebar-section"><span>Archivos</span></div>
     <div id="archivos-lista"><div class="sin-archivos">Todavia no subiste archivos</div></div>
   </div>
@@ -537,19 +563,61 @@ function toggleVoz() {
   else { try { const u = new SpeechSynthesisUtterance(' '); window.speechSynthesis.speak(u); } catch(e) {} }
 }
 
+/* --- Seleccion de voz (tono grave y calmo, estilo JARVIS) --- */
+const TONO = 0.82;      // mas grave
+const VELOCIDAD = 0.96; // apenas mas pausado
+let vozElegida = '';
+try { vozElegida = localStorage.getItem('honey_voz_nombre') || ''; } catch(e) {}
+
+function vocesDisponibles() {
+  let v = [];
+  try { v = window.speechSynthesis.getVoices() || []; } catch(e) {}
+  const esp = v.filter(x => x.lang && x.lang.toLowerCase().indexOf('es') === 0);
+  return esp.length ? esp : v;
+}
+
+function llenarSelectorVoces() {
+  const sel = document.getElementById('voz-select');
+  if (!sel) return;
+  const voces = vocesDisponibles();
+  if (!voces.length) { sel.innerHTML = '<option>(sin voces disponibles)</option>'; return; }
+  sel.innerHTML = voces.map(v =>
+    '<option value="' + v.name + '"' + (v.name === vozElegida ? ' selected' : '') + '>' +
+    v.name + ' (' + v.lang + ')</option>').join('');
+  if (!vozElegida) { vozElegida = voces[0].name; }
+}
+
+function elegirVoz() {
+  const sel = document.getElementById('voz-select');
+  vozElegida = sel.value;
+  try { localStorage.setItem('honey_voz_nombre', vozElegida); } catch(e) {}
+  probarVoz();
+}
+
+function probarVoz() {
+  const previo = vozActiva;
+  vozActiva = true;
+  hablar('A su servicio, senor. En que puedo asistirlo.');
+  vozActiva = previo;
+}
+
 function hablar(texto) {
   if (!vozActiva || !window.speechSynthesis || !texto) return;
   try {
     window.speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(texto);
     u.lang = 'es-AR';
-    u.rate = 1.05;
-    const voces = window.speechSynthesis.getVoices() || [];
-    const v = voces.find(x => x.lang && x.lang.toLowerCase().indexOf('es') === 0);
-    if (v) u.voice = v;
+    u.rate = VELOCIDAD;
+    u.pitch = TONO;
+    const voces = vocesDisponibles();
+    const v = voces.find(x => x.name === vozElegida) || voces[0];
+    if (v) { u.voice = v; if (v.lang) u.lang = v.lang; }
     window.speechSynthesis.speak(u);
   } catch(e) {}
 }
+
+llenarSelectorVoces();
+try { window.speechSynthesis.onvoiceschanged = llenarSelectorVoces; } catch(e) {}
 
 function toggleMic() {
   if (!SR) return;
