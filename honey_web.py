@@ -239,13 +239,15 @@ async def login_form(request: Request, error: str = ""):
     return LOGIN_HTML.replace("<!--ERROR-->", aviso)
 
 @app.post("/login")
-async def login_post(usuario: str = Form(...), password: str = Form(...)):
+async def login_post(request: Request, usuario: str = Form(...), password: str = Form(...)):
     ok = hmac.compare_digest(usuario, HONEY_USER) and hmac.compare_digest(password, HONEY_PASS)
     if not ok:
         return RedirectResponse("/login?error=1", status_code=302)
     resp = RedirectResponse("/", status_code=302)
+    # Si entraste por https, la cookie viaja solo por https (mas seguro).
+    es_https = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
     resp.set_cookie(COOKIE_NAME, crear_token(usuario), max_age=COOKIE_DIAS * 86400,
-                    httponly=True, samesite="lax")
+                    httponly=True, samesite="lax", secure=es_https)
     return resp
 
 @app.get("/logout")
@@ -417,6 +419,10 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
 #texto { flex: 1; background: #1A1A18; border: 1px solid var(--borde); border-radius: 12px; color: var(--texto); font-size: 16px; padding: 11px 14px; resize: none; font-family: inherit; line-height: 1.4; max-height: 120px; outline: none; min-width: 0; }
 #texto:focus { border-color: var(--amarillo); }
 .btn-attach { background: #1A1A18; border: 1px solid var(--borde); border-radius: 12px; min-width: 44px; height: 44px; cursor: pointer; font-size: 20px; color: #8A8578; flex-shrink: 0; }
+.btn-mic { background: #1A1A18; border: 1px solid var(--borde); border-radius: 12px; min-width: 44px; height: 44px; cursor: pointer; font-size: 19px; color: #8A8578; flex-shrink: 0; transition: all .15s; }
+.btn-mic.grabando { background: #F0A028; color: #0A0A0A; border-color: #F0A028; animation: latido 1.1s infinite; }
+@keyframes latido { 0%,100% { box-shadow: 0 0 0 0 rgba(240,160,40,.55); } 50% { box-shadow: 0 0 0 9px rgba(240,160,40,0); } }
+.icon-btn.voz-on { color: var(--amarillo); border-color: var(--amarillo); }
 .btn-send { background: var(--amarillo); color: #0A0A0A; border: none; border-radius: 12px; padding: 0 18px; height: 44px; font-size: 14px; font-weight: 700; cursor: pointer; flex-shrink: 0; }
 .btn-send:disabled { background: #2A2820; color: #504A40; }
 .bienvenida { text-align: center; padding: 48px 24px; color: #504A40; margin: auto; }
@@ -457,7 +463,7 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
   <div class="logo">H</div>
   <h1>HONEY</h1>
   <div class="spacer"></div>
-  <span style="font-size:12px;color:#504A40;">claude</span>
+  <button class="icon-btn" id="btn-voz" onclick="toggleVoz()" title="Que HONEY responda en voz alta">&#128266;</button>
   <a href="/logout" class="icon-btn" title="Salir">&#8631;</a>
 </header>
 <div class="main">
@@ -478,7 +484,8 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
     <div id="input-area">
       <input type="file" id="file-input" accept=".pdf,.docx,.doc,.xlsx,.xls,.txt">
       <button class="btn-attach" onclick="document.getElementById('file-input').click()" title="Adjuntar">+</button>
-      <textarea id="texto" placeholder="Escribi tu mensaje..." rows="1"></textarea>
+      <button class="btn-mic" id="mic" onclick="toggleMic()" title="Hablar">&#127908;</button>
+      <textarea id="texto" placeholder="Escribi o toca el microfono..." rows="1"></textarea>
       <button class="btn-send" id="btn" onclick="enviar()">Enviar</button>
     </div>
   </div>
@@ -505,6 +512,72 @@ const fi = document.getElementById('file-input');
 
 function toggleMenu() { document.body.classList.toggle('menu-abierto'); }
 function cerrarMenu() { document.body.classList.remove('menu-abierto'); }
+
+/* ---------- VOZ: hablarle a HONEY y que responda en voz alta ---------- */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const btnMic = document.getElementById('mic');
+const btnVoz = document.getElementById('btn-voz');
+let recog = null, escuchando = false;
+let vozActiva = false;
+try { vozActiva = localStorage.getItem('honey_voz') === '1'; } catch(e) {}
+
+if (!SR) { btnMic.style.display = 'none'; }
+pintarBotonVoz();
+
+function pintarBotonVoz() {
+  btnVoz.classList.toggle('voz-on', vozActiva);
+  btnVoz.innerHTML = vozActiva ? '&#128266;' : '&#128263;';
+}
+
+function toggleVoz() {
+  vozActiva = !vozActiva;
+  try { localStorage.setItem('honey_voz', vozActiva ? '1' : '0'); } catch(e) {}
+  pintarBotonVoz();
+  if (!vozActiva) { try { window.speechSynthesis.cancel(); } catch(e) {} }
+  else { try { const u = new SpeechSynthesisUtterance(' '); window.speechSynthesis.speak(u); } catch(e) {} }
+}
+
+function hablar(texto) {
+  if (!vozActiva || !window.speechSynthesis || !texto) return;
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(texto);
+    u.lang = 'es-AR';
+    u.rate = 1.05;
+    const voces = window.speechSynthesis.getVoices() || [];
+    const v = voces.find(x => x.lang && x.lang.toLowerCase().indexOf('es') === 0);
+    if (v) u.voice = v;
+    window.speechSynthesis.speak(u);
+  } catch(e) {}
+}
+
+function toggleMic() {
+  if (!SR) return;
+  if (escuchando) { try { recog.stop(); } catch(e) {} return; }
+  try { window.speechSynthesis.cancel(); } catch(e) {}
+  recog = new SR();
+  recog.lang = 'es-AR';
+  recog.interimResults = true;
+  recog.continuous = false;
+  const base = tx.value.trim();
+  let final = '';
+  recog.onstart = () => { escuchando = true; btnMic.classList.add('grabando'); };
+  recog.onresult = (ev) => {
+    let txt = '';
+    for (let i = 0; i < ev.results.length; i++) txt += ev.results[i][0].transcript;
+    final = txt;
+    tx.value = (base ? base + ' ' : '') + txt;
+    tx.style.height = 'auto';
+    tx.style.height = Math.min(tx.scrollHeight, 120) + 'px';
+  };
+  recog.onerror = () => { escuchando = false; btnMic.classList.remove('grabando'); };
+  recog.onend = () => {
+    escuchando = false;
+    btnMic.classList.remove('grabando');
+    if (final.trim()) enviar();
+  };
+  try { recog.start(); } catch(e) { escuchando = false; btnMic.classList.remove('grabando'); }
+}
 
 tx.addEventListener('input', () => { tx.style.height='auto'; tx.style.height=Math.min(tx.scrollHeight,120)+'px'; });
 tx.addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey&&window.innerWidth>760){e.preventDefault();enviar();} });
@@ -631,8 +704,9 @@ async function enviar() {
     const r = await req('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({texto:msg})});
     const d = await r.json();
     p.textContent = d.respuesta; p.classList.remove('pensando');
+    hablar(d.respuesta);
   } catch(e) { p.textContent = 'Error al conectar.'; }
-  btn.disabled=false; tx.focus();
+  btn.disabled=false;
 }
 
 async function cargarHistorial() {
