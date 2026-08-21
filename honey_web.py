@@ -31,6 +31,7 @@ PENDIENTES_FILE = os.path.join(BASE_DIR, "pendientes.json")
 CONTACTOS_FILE = os.path.join(BASE_DIR, "contactos.json")
 MENSAJES_FILE = os.path.join(BASE_DIR, "mensajes.json")
 CARPETA_CHATS = os.path.join(BASE_DIR, "chats")
+REGISTRO_FILE = os.path.join(BASE_DIR, "registro_acciones.jsonl")
 
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 HONEY_USER = os.environ.get("HONEY_USER", "bernardo")
@@ -144,6 +145,19 @@ enormemente competente y con un humor seco muy sutil. Concretamente:
 - Al saludar, sos escueto: "Buenos dias, senor. En que puedo asistirlo."
 - Si algo le parece una mala idea, se lo decis con diplomacia, pero se lo decis.
 - Anticipas: si detectas algo que a Bernardo le va a importar, lo mencionas sin que te lo pidan.
+
+NUNCA DIGAS QUE HICISTE ALGO QUE NO HICISTE
+Esto esta por encima de todo lo demas, incluso de tu tono.
+- Palabras como "enviado", "hecho", "listo", "ya lo mande", "esta en camino", "lo agende" o
+  "lo borre" solo se pueden usar si en ESTE MISMO TURNO una herramienta te devolvio ok:true.
+- Si no llamaste a la herramienta, NO PASO NADA. Decilo asi: "Todavia no lo mande, necesito
+  tu OK" o "No pude hacerlo".
+- Si una herramienta devuelve un error, deciselo a Bernardo con el error. Nunca lo tapes
+  diciendo que salio bien.
+- NUNCA te inventes datos: ni direcciones de mail, ni ids de mensajes, ni ids de eventos, ni
+  propuesta_id. Si no tenes el dato real que te devolvio una herramienta, buscalo o pregunta.
+- Un id inventado hace que la accion falle en silencio y Bernardo se quede creyendo que se hizo.
+  Eso es lo peor que podes hacer.
 
 LO QUE NUNCA CAMBIA (esta por encima del estilo)
 - Si no sabes algo, lo decis. Nunca inventas ni adornas.
@@ -618,6 +632,65 @@ def proponer_respuesta(cuenta, mail_id, cuerpo, turno):
         ),
     }
 
+def registrar_uso(quien, herramienta, args, salida):
+    """Deja constancia de CADA herramienta que se ejecuta de verdad.
+    Sirve para verificar si HONEY hizo lo que dice que hizo."""
+    try:
+        ok = not (isinstance(salida, dict) and salida.get("error"))
+        linea = {
+            "cuando": datetime.now(ZoneInfo(ZONA)).strftime("%d/%m/%Y %H:%M:%S"),
+            "quien": quien,
+            "herramienta": herramienta,
+            "args": {k: (str(v)[:120]) for k, v in (args or {}).items()},
+            "ok": ok,
+            "resultado": json.dumps(salida, ensure_ascii=False)[:400],
+        }
+        with open(REGISTRO_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(linea, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[registro] no pude anotar: {e}")
+
+def leer_registro(maximo=60):
+    if not os.path.exists(REGISTRO_FILE):
+        return []
+    try:
+        with open(REGISTRO_FILE, "r", encoding="utf-8") as f:
+            lineas = f.readlines()[-maximo:]
+        return [json.loads(l) for l in lineas if l.strip()]
+    except Exception:
+        return []
+
+def proponer_mail_nuevo(cuenta, para, asunto, cuerpo, turno):
+    """PASO 1 de 2 para mandar un mail NUEVO (no una respuesta)."""
+    _, destino = _partir_direccion(para or "")
+    if not destino or not es_direccion_valida(destino):
+        return {"error": "Esa direccion no es valida. Si no la sabes, buscala con buscar_contacto "
+                         "o preguntasela a Bernardo. NO la inventes."}
+    if not (cuerpo or "").strip():
+        return {"error": "Falta el texto del mail."}
+    try:
+        d = gmail_crear_borrador(cuenta, destino, asunto or "(sin asunto)", cuerpo)
+    except Exception as e:
+        return {"error": f"No pude preparar el borrador: {e}"}
+    detalle = {"para": destino, "asunto": asunto or "(sin asunto)", "cuerpo": cuerpo,
+               "desde": cuenta}
+    pid = pysecrets.token_urlsafe(8)
+    pend = cargar_pendientes()
+    pend[pid] = {"tipo": "respuesta", "cuenta": cuenta, "draft_id": d.get("draft_id"),
+                 "turno": turno, "detalle": detalle,
+                 "creada": datetime.now().strftime("%d/%m/%Y %H:%M")}
+    guardar_pendientes(pend)
+    return {
+        "propuesta_id": pid,
+        "borrador": detalle,
+        "instruccion": (
+            "NO se envio nada todavia. Mostrale a Bernardo el destinatario, el asunto y el texto "
+            "COMPLETO sin resumir, y pedile permiso. Solo cuando el diga que si, en su PROXIMO "
+            f"mensaje, llama a confirmar_accion con propuesta_id={pid}. "
+            "NUNCA le digas que lo enviaste antes de haber llamado a confirmar_accion."
+        ),
+    }
+
 def proponer_enviar_borrador(cuenta, draft_id, turno):
     """PASO 1 de 2 para mandar un borrador que YA existe en Gmail."""
     if not draft_id:
@@ -946,6 +1019,24 @@ HERRAMIENTAS = [
         },
     },
     {
+        "name": "proponer_mail_nuevo",
+        "description": (
+            "PASO 1 de 2 para mandar un mail NUEVO, que no es respuesta a nada. Prepara el mail "
+            "pero NO lo envia. Usala cuando Bernardo te pide escribirle a alguien de cero. "
+            "Si no sabes la direccion, buscala con buscar_contacto o preguntasela: NUNCA la inventes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cuenta": {"type": "string", "description": "Desde que casilla se manda."},
+                "para": {"type": "string", "description": "Direccion del destinatario."},
+                "asunto": {"type": "string"},
+                "cuerpo": {"type": "string", "description": "El texto completo del mail."},
+            },
+            "required": ["cuenta", "para", "cuerpo"],
+        },
+    },
+    {
         "name": "proponer_enviar_borrador",
         "description": (
             "PASO 1 de 2 para MANDAR un borrador que ya existe en Gmail. Usala cuando ya "
@@ -1158,6 +1249,9 @@ def ejecutar_herramienta(nombre, args, turno=0, quien="Bernardo", rol="dueno"):
             )
         if nombre == "proponer_respuesta":
             return proponer_respuesta(cuenta, args.get("mail_id", ""), args.get("cuerpo", ""), turno)
+        if nombre == "proponer_mail_nuevo":
+            return proponer_mail_nuevo(cuenta, args.get("para", ""), args.get("asunto", ""),
+                                       args.get("cuerpo", ""), turno)
         if nombre == "proponer_enviar_borrador":
             return proponer_enviar_borrador(cuenta, args.get("draft_id", ""), turno)
         if nombre == "buscar_contacto":
@@ -1211,7 +1305,10 @@ def system_completo():
               "no podes ni le pidas que entre a Gmail. Usa la herramienta que corresponda:\n"
               "  - Si hay una propuesta abierta -> confirmar_accion.\n"
               "  - Si armaste un borrador con crear_borrador -> proponer_enviar_borrador.\n"
-              "  - Si todavia no armaste nada -> proponer_respuesta.\n"
+              "  - Si es una respuesta y no armaste nada -> proponer_respuesta.\n"
+              "  - Si es un mail nuevo, de cero -> proponer_mail_nuevo.\n"
+              "Y despues de la propuesta, el mail SIGUE SIN ENVIARSE hasta que llames a "
+              "confirmar_accion y te devuelva ok:true. Hasta ese momento no digas 'enviado'.\n"
               "\n"
               "Usa las herramientas para consultarlas cuando haga falta. Reglas:\n"
               "- Si no aclara de cual casilla habla y hay mas de una, preguntale.\n"
@@ -1325,6 +1422,7 @@ def responder_conversacion(texto_usuario, archivo_memoria, quien="Bernardo", rol
             if b.type == "tool_use":
                 usadas.append(b.name)
                 salida = ejecutar_herramienta(b.name, b.input or {}, turno, quien, rol)
+                registrar_uso(quien, b.name, b.input or {}, salida)
                 resultados.append({"type": "tool_result", "tool_use_id": b.id,
                                    "content": json.dumps(salida, ensure_ascii=False)[:60000]})
         mensajes = mensajes + [{"role": "user", "content": resultados}]
@@ -1606,6 +1704,11 @@ async def chat(mensaje: Mensaje, usuario: str = Depends(requerir_login)):
 async def historial(usuario: str = Depends(requerir_login)):
     return cargar_historial()
 
+@app.get("/registro")
+async def registro(usuario: str = Depends(requerir_login)):
+    """Lo que HONEY hizo de verdad. Si algo no figura aca, no paso."""
+    return {"acciones": list(reversed(leer_registro(60)))}
+
 # ---------------- WHATSAPP ----------------
 @app.get("/whatsapp/webhook")
 async def wa_verificar(request: Request):
@@ -1798,6 +1901,7 @@ header h1 { font-size: 16px; font-weight: 700; color: var(--amarillo); }
 #voz-select:focus { border-color: var(--amarillo); }
 .btn-probar { background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: #C8B890; font-size: 12.5px; font-weight: 600; padding: 8px; cursor: pointer; text-align: center; }
 .btn-probar:active { border-color: var(--amarillo); color: var(--amarillo); }
+.sello { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--borde); font-size: 11px; color: #6A8A5A; letter-spacing: .02em; }
 .wa-area { padding: 10px; border-bottom: 1px solid var(--borde); display: flex; flex-direction: column; gap: 6px; }
 .wa-area input, .wa-area select { background: #1A1A18; border: 1px solid var(--borde); border-radius: 8px; color: var(--texto); font-size: 12.5px; padding: 8px 9px; width: 100%; outline: none; font-family: inherit; }
 .wa-area input:focus, .wa-area select:focus { border-color: var(--amarillo); }
@@ -2290,6 +2394,14 @@ async function enviar() {
     const r = await req('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({texto:msg})});
     const d = await r.json();
     p.textContent = d.respuesta; p.classList.remove('pensando');
+    // Sello de lo que REALMENTE se ejecuto. Si HONEY dice "enviado" y aca no
+    // aparece nada, no lo mando: dijo algo que no hizo.
+    if (d.herramientas && d.herramientas.length) {
+      const s = document.createElement('div');
+      s.className = 'sello';
+      s.textContent = 'Ejecutado: ' + [...new Set(d.herramientas)].join(', ');
+      p.appendChild(s);
+    }
     // En modo conversacion, cuando termina de hablar vuelve a abrir el microfono.
     hablar(d.respuesta, seguirConversacion);
   } catch(e) { p.textContent = 'Error al conectar.'; seguirConversacion(); }
