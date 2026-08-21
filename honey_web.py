@@ -632,11 +632,105 @@ def proponer_respuesta(cuenta, mail_id, cuerpo, turno):
         ),
     }
 
+# =====================================================================
+# SINCERIDAD: que no pueda decir que hizo algo que no hizo
+# =====================================================================
+
+# Herramientas que cambian algo de verdad en el mundo.
+ACCIONES_REALES = ("confirmar_accion", "crear_evento", "crear_borrador", "dejar_mensaje")
+
+# Formas en que HONEY declara una accion COMO YA HECHA.
+# Ojo con los acentos: "agende" (que lo agende) es pregunta, "agende'" con tilde es
+# afirmacion. Para las formas de primera persona exigimos la tilde a proposito.
+_CLAIMS = [
+    r"enviad[oa]s?\b",
+    r"\benvi[eé]\b", r"\bmand[eé]\b", r"\bborr[eé]\b", r"\belimin[eé]\b",
+    r"\barchiv[eé]\b", r"\bagend[eé]\b", r"\bcancel[eé]\b", r"\bdespach[eé]\b",
+    r"qued[oó] enviad", r"qued[oó] agendad", r"qued[oó] cancelad",
+    r"est[aá] en camino a", r"ya sali[oó]", r"sali[oó] el mail",
+    r"a la papelera\b",
+]
+_RE_CLAIM = _re.compile("|".join(_CLAIMS), _re.IGNORECASE)
+# "Listo" / "Hecho" al principio de la frase tambien es hecho consumado.
+_RE_LISTO = _re.compile(r"(?:^|[.\n!]\s*)(listo|hecho)\b", _re.IGNORECASE)
+# Negaciones que desactivan la afirmacion dentro de la misma frase.
+_RE_NEGACION = _re.compile(r"\b(no|nunca|todav[ií]a no|a[uú]n no|sin|antes de|cuando|si me)\b",
+                           _re.IGNORECASE)
+
+def _frases(texto):
+    """Corta el texto en frases, para evaluar cada afirmacion en su contexto."""
+    return [f for f in _re.split(r"(?<=[.!?\n])\s+", texto or "") if f.strip()]
+
+AVISO_SINCERIDAD = (
+    "No ejecute ninguna accion, asi que NO se envio, borro ni agendo nada. "
+    "Me confundi al redactar la respuesta anterior.\n\n"
+    "Si querias que lo hiciera, pedimelo de nuevo con estas palabras: "
+    "\"confirmo, hacelo ahora\". Voy a usar la herramienta que corresponde y "
+    "te voy a mostrar abajo que quedo ejecutado."
+)
+
+def texto_declara_hecho(texto):
+    """True si el texto afirma que una accion YA se concreto.
+    Se evalua frase por frase: una negacion o una pregunta desactivan la afirmacion."""
+    for f in _frases(texto):
+        m = _RE_CLAIM.search(f) or _RE_LISTO.search(f)
+        if not m:
+            continue
+        if "?" in f or "¿" in f:
+            continue                      # "queres que lo agende?" no es una afirmacion
+        anterior = f[:m.start()]
+        if _RE_NEGACION.search(anterior):
+            continue                      # "todavia no la envie", "cuando confirmes lo mando"
+        return True
+    return False
+
+def verificar_sinceridad(texto, acciones_ok):
+    """Candado final: si HONEY dice que hizo algo y no ejecuto ninguna accion real,
+    el servidor corrige la respuesta. No es una sugerencia al modelo: se aplica aca."""
+    if acciones_ok:
+        return texto, False
+    if not texto_declara_hecho(texto):
+        return texto, False
+    return AVISO_SINCERIDAD, True
+
+def bloque_pendientes():
+    """Las propuestas abiertas, CON su propuesta_id, para que HONEY pueda confirmarlas
+    en un turno posterior. Sin esto el id se pierde y el paso 2 es imposible."""
+    pend = cargar_pendientes()
+    if not pend:
+        return ""
+    lineas = []
+    for pid, p in list(pend.items())[-6:]:
+        d = p.get("detalle") or {}
+        tipo = p.get("tipo", "mail")
+        if tipo == "respuesta":
+            que = f"enviar un mail a {d.get('para','?')} (asunto: {d.get('asunto','?')})"
+        elif tipo == "reunion":
+            que = f"crear la reunion '{d.get('titulo','?')}' e invitar a {', '.join(d.get('invitados', []))}"
+        elif tipo == "evento":
+            que = f"cancelar el evento '{d.get('titulo','?')}'"
+        else:
+            que = f"mandar {len(p.get('ids', []))} mails a {p.get('accion','?')}"
+        lineas.append(f"- propuesta_id={pid} -> {que} (propuesta el {p.get('creada','?')})")
+    return (
+        "\n\n===== PROPUESTAS ABIERTAS, ESPERANDO TU OK =====\n"
+        "Estas acciones estan preparadas y NO se ejecutaron todavia:\n"
+        + "\n".join(lineas) +
+        "\n\nSi Bernardo confirma alguna ('mandalo', 'dale', 'confirmo', 'esta OK'), llama a "
+        "confirmar_accion con ese propuesta_id EXACTO, copiado de esta lista. "
+        "Es el unico modo de que la accion ocurra. Si no llamas a la herramienta, no pasa nada, "
+        "por mas que escribas que si.\n"
+        "Si no sabes cual quiere, preguntale cual de estas."
+    )
+
 def registrar_uso(quien, herramienta, args, salida):
     """Deja constancia de CADA herramienta que se ejecuta de verdad.
     Sirve para verificar si HONEY hizo lo que dice que hizo."""
     try:
-        ok = not (isinstance(salida, dict) and salida.get("error"))
+        if isinstance(salida, dict) and "ok" in salida:
+            ok = bool(salida.get("ok"))
+        else:
+            ok = not (isinstance(salida, dict) and salida.get("error"))
         linea = {
             "cuando": datetime.now(ZoneInfo(ZONA)).strftime("%d/%m/%Y %H:%M:%S"),
             "quien": quien,
@@ -1399,10 +1493,16 @@ def responder_conversacion(texto_usuario, archivo_memoria, quien="Bernardo", rol
     turno = len(h)
 
     sistema = system_completo() if rol == "dueno" else system_invitado(quien)
+    if rol == "dueno":
+        # Las propuestas abiertas viajan en el prompt: el propuesta_id no sobrevive
+        # en el historial (solo se guarda el texto), asi que sin esto el paso 2
+        # es literalmente imposible.
+        sistema += bloque_pendientes()
     hay_cuentas = bool(cargar_cuentas())
     tools = herramientas_para(rol) if hay_cuentas else []
     mensajes = historial_para_api(h)
     usadas = []
+    acciones_ok = []
     texto = ""
 
     for _ in range(6):
@@ -1423,6 +1523,8 @@ def responder_conversacion(texto_usuario, archivo_memoria, quien="Bernardo", rol
                 usadas.append(b.name)
                 salida = ejecutar_herramienta(b.name, b.input or {}, turno, quien, rol)
                 registrar_uso(quien, b.name, b.input or {}, salida)
+                if b.name in ACCIONES_REALES and isinstance(salida, dict) and salida.get("ok"):
+                    acciones_ok.append(b.name)
                 resultados.append({"type": "tool_result", "tool_use_id": b.id,
                                    "content": json.dumps(salida, ensure_ascii=False)[:60000]})
         mensajes = mensajes + [{"role": "user", "content": resultados}]
@@ -1431,6 +1533,13 @@ def responder_conversacion(texto_usuario, archivo_memoria, quien="Bernardo", rol
 
     if not texto:
         texto = "No obtuve respuesta. Intentemos de nuevo."
+
+    # Candado de sinceridad, aplicado por el servidor y no por el modelo.
+    texto, corregido = verificar_sinceridad(texto, acciones_ok)
+    if corregido:
+        registrar_uso(quien, "CORRECCION_SINCERIDAD", {"dijo_que_hizo_algo": True},
+                      {"ok": False, "nota": "Se corrigio la respuesta: no hubo accion real."})
+        usadas = usadas + ["correccion-del-servidor"]
 
     h.append({"role": "assistant", "content": texto})
     guardar_historial(h, archivo_memoria)
