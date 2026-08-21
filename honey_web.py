@@ -558,8 +558,9 @@ def proponer_limpieza(cuenta, ids, accion, turno):
         "mails": detalle,
         "instruccion": (
             f"NO esta hecho todavia. Mostrale a Bernardo esta lista y pedile permiso para {verbo} "
-            f"estos {len(ids)} mails. Solo si el responde que si, en su PROXIMO mensaje, llama a "
-            f"confirmar_limpieza con propuesta_id={pid}. No la llames ahora."
+            f"estos {len(ids)} mails. En cuanto el conteste que si ('dale', 'ok', 'confirmo', lo que sea), "
+            f"llama a confirmar_accion con propuesta_id={pid} en esa misma respuesta. "
+            "Lo unico que no podes hacer es confirmarla en este mismo mensaje."
         ),
     }
 
@@ -583,7 +584,7 @@ def proponer_cancelar_evento(cuenta, evento_id, turno):
     guardar_pendientes(pend)
     return {"propuesta_id": pid, "evento": detalle,
             "instruccion": ("NO esta cancelado todavia. Mostrale el evento a Bernardo y pedile "
-                            f"permiso. Solo si dice que si, en su PROXIMO mensaje, llama a "
+                            f"permiso. En cuanto diga que si, llama en esa misma respuesta a "
                             f"confirmar_accion con propuesta_id={pid}.")}
 
 def proponer_respuesta(cuenta, mail_id, cuerpo, turno):
@@ -626,7 +627,7 @@ def proponer_respuesta(cuenta, mail_id, cuerpo, turno):
         "instruccion": (
             "NO se envio nada todavia. Mostrale a Bernardo el destinatario, el asunto y el "
             "texto COMPLETO de la respuesta, sin resumirlo, y pedile permiso para enviarla. "
-            f"Solo si el dice que si, en su PROXIMO mensaje, llama a confirmar_accion con "
+            f"En cuanto el diga que si (con cualquier palabra), llama a confirmar_accion con "
             f"propuesta_id={pid}. Si te pide cambios, volve a llamar a proponer_respuesta "
             "con el texto nuevo. Avisale que un mail enviado no se puede deshacer."
         ),
@@ -662,12 +663,36 @@ def _frases(texto):
     return [f for f in _re.split(r"(?<=[.!?\n])\s+", texto or "") if f.strip()]
 
 AVISO_SINCERIDAD = (
-    "No ejecute ninguna accion, asi que NO se envio, borro ni agendo nada. "
-    "Me confundi al redactar la respuesta anterior.\n\n"
-    "Si querias que lo hiciera, pedimelo de nuevo con estas palabras: "
-    "\"confirmo, hacelo ahora\". Voy a usar la herramienta que corresponde y "
-    "te voy a mostrar abajo que quedo ejecutado."
+    "Me equivoque: no llegue a ejecutar la accion, asi que no salio nada. "
+    "Perdon por la confusion.\n\n"
+    "¿Lo hago ahora?"
 )
+
+# Como suena una confirmacion en castellano de todos los dias. Bernardo no tiene
+# que aprenderse ninguna formula: alcanza con que hable normal.
+_RE_CONFIRMA = _re.compile(
+    r"^\s*(?:"
+    r"(?:s[ií]|ok\w*|dale|listo|perfecto|genial|bien|buenis[ií]mo|correcto|"
+    r"confirmo|confirmado|adelante|obvio|claro|exacto|va|vamos|hac[eé]lo|haz[eé]lo|"
+    r"proced\w*|segu[ií]|m[aá]ndal[oa]|mand[aá]l[oa]|mand[aá]|env[ií]al[oa]|envi[aá]|and[aá])"
+    r"[\s,\.!¡:;]*"
+    r")+"
+    r"(?:(?:que\s+)?(?:lo|la|los|las)?\s*"
+    r"(?:mand[aáeé]\w*|env[ií]\w*|hac\w*|dale|sale|va|ahora|ya|por\s*favor|porfa|nom[aá]s|"
+    r"as[ií]|est[aá]\s*(?:bien|ok)|adelante|proced\w*)"
+    r"[\s,\.!¡:;]*)*$",
+    _re.IGNORECASE)
+
+def parece_confirmacion(texto):
+    """True si el mensaje es, en lenguaje natural, un 'dale, hacelo'."""
+    t = (texto or "").strip()
+    if not t or len(t) > 90:
+        return False
+    if "?" in t or "¿" in t:
+        return False          # "¿lo mandaste?" es una pregunta, no una orden
+    if _re.search(r"\b(no|todav[ií]a no|a[uú]n no|esper|par[aá]|cancel|mejor no)\b", t, _re.IGNORECASE):
+        return False
+    return bool(_RE_CONFIRMA.match(t))
 
 def texto_declara_hecho(texto):
     """True si el texto afirma que una accion YA se concreto.
@@ -716,11 +741,15 @@ def bloque_pendientes():
         "\n\n===== PROPUESTAS ABIERTAS, ESPERANDO TU OK =====\n"
         "Estas acciones estan preparadas y NO se ejecutaron todavia:\n"
         + "\n".join(lineas) +
-        "\n\nSi Bernardo confirma alguna ('mandalo', 'dale', 'confirmo', 'esta OK'), llama a "
-        "confirmar_accion con ese propuesta_id EXACTO, copiado de esta lista. "
-        "Es el unico modo de que la accion ocurra. Si no llamas a la herramienta, no pasa nada, "
-        "por mas que escribas que si.\n"
-        "Si no sabes cual quiere, preguntale cual de estas."
+        "\n\nBernardo habla normal, no con comandos. CUALQUIER forma de decir que si "
+        "('dale', 'ok', 'mandalo', 'confirmo', 'si', 'hacelo', 'perfecto', 'va', 'listo') es "
+        "una confirmacion: llama a confirmar_accion con ese propuesta_id EXACTO, copiado de "
+        "esta lista, en esa misma respuesta.\n"
+        "NUNCA le pidas que use una frase determinada, ni le expliques como tiene que hablarte. "
+        "Es tu jefe, no un usuario de un sistema.\n"
+        "Si no entendes a cual de las propuestas se refiere, preguntale cual, nombrandolas.\n"
+        "Llamar a la herramienta es el unico modo de que la accion ocurra: si no la llamas, "
+        "no pasa nada por mas que escribas que si."
     )
 
 def registrar_uso(quien, herramienta, args, salida):
@@ -853,7 +882,7 @@ def proponer_reunion(cuenta, titulo, inicio, fin, invitados, descripcion, donde,
         "instruccion": (
             "NO se creo nada todavia y NO se mando ninguna invitacion. Mostrale a Bernardo el "
             "dia, la hora y la LISTA COMPLETA de direcciones invitadas, y pedile permiso. "
-            f"Solo si dice que si, en su PROXIMO mensaje, llama a confirmar_accion con "
+            f"En cuanto diga que si (con cualquier palabra), llama a confirmar_accion con "
             f"propuesta_id={pid}." + aviso
         ),
     }
@@ -1505,11 +1534,29 @@ def responder_conversacion(texto_usuario, archivo_memoria, quien="Bernardo", rol
     acciones_ok = []
     texto = ""
 
+    # Si Bernardo confirmo en criollo y hay UNA sola propuesta abierta, no le pedimos
+    # al modelo que ejecute: lo obligamos. El permiso ya lo dio; que la accion ocurra
+    # no puede depender de que el modelo se acuerde de llamar a la herramienta.
+    forzar = None
+    if rol == "dueno" and tools and parece_confirmacion(texto_usuario):
+        abiertas = cargar_pendientes()
+        if len(abiertas) == 1:
+            forzar = {"type": "tool", "name": "confirmar_accion"}
+            unica = list(abiertas.keys())[0]
+            sistema += (f"\n\nBernardo ACABA DE CONFIRMAR. Llama a confirmar_accion con "
+                        f"propuesta_id={unica} ahora mismo. Es la unica propuesta abierta.")
+        elif len(abiertas) > 1:
+            sistema += ("\n\nBernardo ACABA DE CONFIRMAR pero hay varias propuestas abiertas. "
+                        "Preguntale cual de ellas quiere que ejecutes, nombrandolas.")
+
     for _ in range(6):
         kw = {"model": "claude-haiku-4-5", "max_tokens": 2048,
               "system": sistema, "messages": mensajes}
         if tools:
             kw["tools"] = tools
+        if forzar:
+            kw["tool_choice"] = forzar
+            forzar = None   # solo en la primera vuelta; despues sigue normal
         r = client.messages.create(**kw)
 
         if r.stop_reason != "tool_use":
